@@ -1,0 +1,496 @@
+---
+Title: Analysis of Wildlife Strikes in Commercial Aviation
+Subtitle: Practicum I CS5200
+Author: Kuan Chun Chiu
+Author_email: chiu.kua@northeastern.edu
+Date: 2024 Fall Semester
+---
+
+# Analysis of Wildlife Strikes in Commercial Aviation
+## Practicum I CS5200
+### Author: Kuan Chun Chiu
+### Date: 2024 Fall Semester
+
+## Question 3. Connect to MySQL Database
+```{r connect_to_db, echo=T, warning=F}
+library(DBI)
+library(RMySQL)
+
+# Define connection parameters
+host = "derekchiu-mysql-avien-service-aircraft-birds-strike-analysis.i.aivencloud.com"
+user = "avnadmin"
+password = "AVNS_l7gYA424n1NtdnepYjq"
+
+# Connect to MySQL
+conn = dbConnect(MySQL(), user=user, password=password, host=host,                   port=26901)
+
+# Create a database in MySQL
+dbExecute(conn, "CREATE DATABASE IF NOT EXISTS aircraft_db")
+
+# Connect to the aircraft_db database
+dbDisconnect(conn)
+conn = dbConnect(MySQL(), user=user, password=password, host=host,
+                 port=26901, dbname="aircraft_db")
+conn
+```
+### Temporarily Disabled the Foreign Key Constraint When Creating Tables
+```{r disable_fk_constraint, echo=T, warning=F}
+# Disable the foreign key checking constraint, so parents table can be created before child tables
+disable_fk = "
+SET FOREIGN_KEY_CHECKS = 0;
+"
+dbExecute(conn, disable_fk)
+```
+### Drop All Tables, Stored Procedures, and Triggers Within the Database
+```{r, clean_up_database, echo=T, warning=F}
+# Drop the tables first so later when the code ran again during kitting, the tables can be re-created and data can be re-inserted into them
+for (table in dbListTables(conn)){
+  if (table == "wildlife.strikes"){
+    table = "`wildlife.strikes`"
+  }
+  dbExecute(conn, paste0("DROP TABLE IF EXISTS ", table))
+}
+
+# Drop the stored procedure
+dbExecute(conn, "DROP PROCEDURE IF EXISTS update_airport_code")
+
+# Drop the trigger
+dbExecute(conn, "DROP TRIGGER IF EXISTS check_airportcode_update")
+```
+## Question 4. Create Tables in the Database
+```{r create_tables, echo=T, warning=F}
+# Part A, C
+create_flights = "
+CREATE TABLE IF NOT EXISTS flights (
+  fid INTEGER PRIMARY KEY,
+  date DATE,
+  originAirport INTEGER,
+  airlineName TEXT,
+  aircraftType TEXT,
+  isHeavy TINYINT(1) DEFAULT 0,
+  FOREIGN KEY (originAirport) REFERENCES airports (aid)
+);
+"
+# Part B
+create_airports = "
+CREATE TABLE IF NOT EXISTS airports (
+  aid INTEGER PRIMARY KEY,
+  airportName TEXT,
+  airportState TEXT,
+  airportCode VARCHAR(255) DEFAULT 'ZZZ'
+);
+"
+# Part D
+create_lookup = "
+CREATE TABLE IF NOT EXISTS conditions (
+  cid INTEGER PRIMARY KEY,
+  sky_condition TEXT,
+  explanation VARCHAR(255) DEFAULT ' '
+);
+"
+# Part E, F
+create_wl_strikes = "
+CREATE TABLE IF NOT EXISTS `wildlife.strikes` (
+  iid INTEGER PRIMARY KEY,
+  fid INTEGER,
+  wlsize INTEGER,
+  impact TEXT,
+  altitude INTEGER,
+  conditions INTEGER,
+  CHECK (altitude >= 0),
+  FOREIGN KEY (fid) REFERENCES flights (fid),
+  FOREIGN KEY (conditions) REFERENCES conditions (cid),
+  FOREIGN KEY (wlsize) REFERENCES wlsizes (wid)
+);
+"
+# Part E
+create_wlsizes = "
+CREATE TABLE IF NOT EXISTS wlsizes (
+  wid INTEGER PRIMARY KEY,
+  size TEXT
+);
+"
+
+# Use a function to loop through all sql statements to create the 5 needed tables
+tables = c(create_flights, create_airports, create_lookup,
+           create_wl_strikes, create_wlsizes)
+create_tables = function(table_list){
+  for (table in table_list){
+    dbExecute(conn, table)
+  }
+}
+create_tables(tables)
+
+# Make sure all 5 tables are created and exist in the database
+dbListTables(conn)
+```
+## Question 4. Part G: Check Table Constraints
+```{r test_tables, echo=T, eval=F, warning=F}
+# Check the needed columns exist for all tables
+for (table in dbListTables(conn)){
+  print (paste0("Table: ", table))
+  if (table == "wildlife.strikes"){
+    table = "`wildlife.strikes`"
+  }
+  columns = dbListFields(conn, table)
+  print (paste0("Columns: ", columns))
+  print ("-----------------------------------------")
+}
+
+# Check the data type of columns in flights table is correct
+check_dtype = "
+SHOW CREATE TABLE flights;
+"
+dbGetQuery(conn, check_dtype)
+
+# Check the foreign key constraint in between the lookup table and wildlife.strikes table
+check_fk = "
+SELECT * FROM information_schema.table_constraints 
+WHERE table_name = 'wildlife.strikes'
+AND constraint_type = 'FOREIGN KEY'
+"
+dbGetQuery(conn, check_fk)
+
+# Check the foreign key constraint in between the airports table and flights table
+check_fk = "
+SELECT * FROM information_schema.table_constraints 
+WHERE table_name = 'flights'
+AND constraint_type = 'FOREIGN KEY'
+"
+dbGetQuery(conn, check_fk)
+```
+## Question 5. Load the aircraft csv File
+```{r load_csv, echo=F, warning=F}
+# Load the aircraft csv file intoa data frame called bds.raw
+csv_file = "BirdStrikesData-V4-SuF24.csv"
+bds.raw = read.csv(file=csv_file)
+head(bds.raw)
+```
+## Question 6. Populate the flights Table with Data From bds.raw
+```{r populate_flights, echo=T, warning=F}
+library(zoo)
+# Create a function to extract a subset of dataset from bds.raw for the flights table
+create_flights_df = function(df){
+  flights_cols = c("flight_date", "airline", "aircraft",                               "heavy_flag")
+  flights_df = df[, flights_cols]
+  flights_df$fid = (1:nrow(flights_df))
+  flights_df$originAirport = (1:nrow(flights_df))
+  col_order = c("fid", "flight_date", "originAirport", "airline",                   "aircraft", "heavy_flag")
+  flights_df = flights_df[, col_order]
+  colnames(flights_df)[colnames(flights_df) == "flight_date"] =       "date"
+  colnames(flights_df)[colnames(flights_df) == "airline"] =           "airlineName"
+  colnames(flights_df)[colnames(flights_df) == "aircraft"] =          "aircraftType"
+  colnames(flights_df)[colnames(flights_df) == "heavy_flag"] =        "isHeavy"
+  return (flights_df)
+}
+flights_df = create_flights_df(bds.raw)
+
+# Clean the data to fill missing dates, replace empty values in other columns as "unknown", and add 1 & 0 to isHeavy column to express T & F since boolean isn't supported by MySQL
+flights_df$date = as.Date(strptime(flights_df$date, format="%m/%d/%y %H:%M"), format="%Y-%m-%d")
+flights_df$date = zoo::na.locf(flights_df$date, na.rm = FALSE)
+flights_df$airlineName[flights_df$airlineName == "" | flights_df$airlineName == " "] = "unknown"
+flights_df$aircraftType[flights_df$aircraftType == "" | flights_df$aircraftType == " "] = "unknown"
+flights_df$isHeavy[flights_df$isHeavy == "" | flights_df$isHeavy == " "] = "unknown"
+flights_df$isHeavy = ifelse(flights_df$isHeavy == "Yes" | flights_df$isHeavy == "unknown", 1, 0)
+
+# Create a function to batch insert the df data to the flights table
+batch_insert = function(df, conn, query, batch_size = 1000) {
+  row_num = nrow(df)
+  for (idx in seq(1, row_num, by = batch_size)) {
+    end = min(idx + batch_size - 1, row_num)
+    batch = df[idx:end, ]
+    values = apply(batch, 1, function(row) {
+      formatted_values = sapply(row, function(value) {
+        if (is.numeric(value)) {
+          as.character(value)
+        } else {
+          paste0("'", gsub("'", "''", value), "'")
+        }
+      })
+      paste0("(", paste(formatted_values, collapse = ", "), ")")
+    })
+    value_string = paste(values, collapse = ", ")
+    batch_query = paste0(query, value_string)
+    dbSendQuery(conn, batch_query)
+  }
+}
+
+# Execute the function to fill data into the flights table
+flights_query = "INSERT INTO flights (fid, date, originAirport, airlineName, aircraftType, isHeavy) VALUES "
+batch_insert(flights_df, conn, flights_query)
+```
+## Question 6. Populate the airports table with data from bds.raw
+```{r populate_airports, echo=T, warning=F}
+# Create a function to extract a subset of dataset from bds.raw for the airports table
+create_airports_df = function(df){
+  airports_cols = c("dep_airport", "origin_state")
+  airports_df = df[, airports_cols]
+  airports_df$aid = (1:nrow(airports_df))
+  col_order = c("aid", "dep_airport", "origin_state")
+  airports_df = airports_df[, col_order]
+  colnames(airports_df)[colnames(airports_df) == "dep_airport"] =     "airportName"
+  colnames(airports_df)[colnames(airports_df) == "origin_state"] =    "airportState"
+  return (airports_df)
+}
+airports_df = create_airports_df(bds.raw)
+
+# Clean the data to replace missing airport states and empty values in airport name as "unknown"
+airports_df$airportName[airports_df$airportName == "" | airports_df$airportName == " "] = "unknown"
+airports_df$airportState[airports_df$airportState == "N/A"] = "unknown"
+
+# Load the data frame into airports table
+airports_query = "INSERT INTO airports (aid, airportName, airportState) VALUES "
+batch_insert(airports_df, conn, airports_query)
+```
+## Question 6. Populate the conditions Table with Data From bds.raw
+```{r populate_conditions, echo=T, warning=F}
+# Insert data into the conditions lookup table
+insert_conditions = "
+INSERT INTO conditions VALUES
+  (1, 'No Cloud', ' '),
+  (2, 'Some Cloud', ' '),
+  (3, 'Overcast', ' ');
+"
+dbExecute(conn, insert_conditions)
+```
+## Question 6. Populate the wlsizes Table with Data From bds.raw
+```{r populate_wlsizes, echo=T, warning=F}
+# Insert data into the wlsize lookup table
+insert_wlsizes = "
+INSERT INTO wlsizes VALUES
+  (1, 'Small'),
+  (2, 'Medium'),
+  (3, 'Large');
+"
+dbExecute(conn, insert_wlsizes)
+```
+## Question 6. Populate the wildlife.strikes Table with Data From bds.raw
+```{r populate_wildlife.strikes, echo=T, warning=F}
+library(dplyr)
+# Create a function to extract a subset of dataset from bds.raw for the wildlife.strikes table
+create_wlstrikes_df = function(df){
+  wlstrikes_cols = c("iid", "wildlife_size", "impact",                                   "altitude_ft", "sky_conditions")
+  wlstrikes_df = df[, wlstrikes_cols]
+  wlstrikes_df$fid = (1:nrow(wlstrikes_df))
+  col_order = c("iid", "fid", "wildlife_size", "impact",                            "altitude_ft", "sky_conditions")
+  wlstrikes_df = wlstrikes_df[, col_order]
+  colnames(wlstrikes_df)[colnames(wlstrikes_df) ==                    "wildlife_size"] = "wlsize"
+  colnames(wlstrikes_df)[colnames(wlstrikes_df) ==                    "altitude_ft"] = "altitude"
+  colnames(wlstrikes_df)[colnames(wlstrikes_df) ==                    "sky_conditions"] = "conditions"
+  return (wlstrikes_df)
+}
+wlstrikes_df = create_wlstrikes_df(bds.raw)
+
+# Replacing empty values in wlsize, impact, and altitude column with the most common value in them
+wlstrikes_df$wlsize[wlstrikes_df$wlsize == ""] = "Small"
+wlstrikes_df$impact[wlstrikes_df$impact == ""] = "None"
+wlstrikes_df$altitude[wlstrikes_df$altitude == ""] = 0
+
+# Remove comma sign from the altitude column
+wlstrikes_df$altitude = gsub(",", "", wlstrikes_df$altitude)
+
+# Update the wlsize and conditions column to match the primary key value in the look up tables, which are wlsizes and conditions
+wlstrikes_df = wlstrikes_df %>%
+  mutate(wlsize = recode(wlsize, "Small" = 1, 
+                                "Medium" = 2, "Large" = 3))
+wlstrikes_df = wlstrikes_df %>%
+  mutate(conditions = recode(conditions, "No Cloud" = 1, 
+                             "Some Cloud" = 2, "Overcast" = 3))
+
+# Load the data frame into airports table
+wlstrikes_query = "INSERT INTO `wildlife.strikes` (iid, fid, wlsize, impact, altitude, conditions) VALUES "
+batch_insert(wlstrikes_df, conn, wlstrikes_query)
+```
+## Question 7. Display the Table Contents
+```{r display_tables, echo=F, eval=F, warning=F}
+# Show the contents in all tables in the databse, in the form of data frames
+all_tables = dbListTables(conn)
+for (table in all_tables){
+  if (table == "wildlife.strikes"){
+    table = "`wildlife.strikes`"
+  }
+  query = paste0("SELECT * FROM ", table)
+  df = dbGetQuery(conn, query)
+  print (head(df))
+}
+```
+### Enable the Foreign Key Constraint Again
+```{r enable_fk_constraint, echo=T, warning=F}
+# Now the tables are all properly created, enable the foreign key constraint again to support join statements in future sql queries
+enable_fk = "
+SET FOREIGN_KEY_CHECKS = 1;
+"
+dbExecute(conn, enable_fk)
+```
+## Question 8. Top States with Strikes
+```{r states_with_most_strikes, echo=F, warning=F}
+# Create a query statement to find the top 5 states with the most wildlife strikes incidents
+library(kableExtra)
+top_strikes = "
+SELECT airportState, COUNT(aid) AS number_of_incidents
+FROM airports
+GROUP BY airportState
+ORDER BY number_of_incidents DESC
+LIMIT 5;
+"
+
+# Execute the query to get the result and organize it into a tabular format using kable() function
+top_strikes_df = dbGetQuery(conn, top_strikes)
+kable(top_strikes_df)
+```
+## Question 9. Analysis by Airport
+```{r airport_analysis, echo=F, warning=F}
+# Find the value of average number of wildlife strikes across all airports in the dataset
+find_avg_incidents = "
+SELECT AVG(incident_count) AS Avg_incident_count
+FROM (
+  SELECT COUNT(aid) AS incident_count
+  FROM airports
+  GROUP BY airportName
+) AS incident_counts;
+"
+avg_incident_df = dbGetQuery(conn, find_avg_incidents)
+avg_incident = avg_incident_df[1, 1]
+
+# Create a query statement to find the first 5 airports with a below average number of wildlife strikes incident
+below_avg_airports = paste0("
+SELECT airportName, COUNT(aid) AS incident_count
+FROM airports
+GROUP BY airportName
+HAVING incident_count < ", avg_incident, " LIMIT 5", ";")
+
+# Execute the query to get the result and put it into tabular form using kable() function
+below_avg_airport_df = dbGetQuery(conn, below_avg_airports)
+kable(below_avg_airport_df)
+```
+## Question 10. Analysis by Year
+```{r year_analysis, echo=F, warning=F}
+# Add a new column called year in the flights table
+add_year_column = "
+ALTER TABLE flights
+ADD COLUMN year INT DEFAULT 2000;
+"
+dbExecute(conn, add_year_column)
+
+# Update the value in the year column based on the date column, in the flights table
+update_year_column = "
+UPDATE flights
+SET year = (CASE
+                WHEN date LIKE '2000%' THEN 2000
+                WHEN date LIKE '2001%' THEN 2001
+                WHEN date LIKE '2002%' THEN 2002
+                WHEN date LIKE '2003%' THEN 2003
+                WHEN date LIKE '2004%' THEN 2004
+                WHEN date LIKE '2005%' THEN 2005
+                WHEN date LIKE '2006%' THEN 2006
+                WHEN date LIKE '2007%' THEN 2007
+                WHEN date LIKE '2008%' THEN 2008
+                WHEN date LIKE '2009%' THEN 2009
+                WHEN date LIKE '2010%' THEN 2010
+                WHEN date LIKE '2011%' THEN 2011
+            END);
+"
+dbExecute(conn, update_year_column)
+
+# Create a query statement to find the number of wildlife strikes per year for sizes of small, medium, and large wildlifes
+find_wlsize_strikes = "
+SELECT f.year,
+       COUNT(CASE
+                 WHEN s.size = 'Small' THEN w.iid
+             END) AS small_wl_strikes,
+       COUNT(CASE
+                 WHEN s.size = 'Medium' THEN w.iid
+             END) AS medium_wl_strikes,
+       COUNT(CASE
+                 WHEN s.size = 'Large' THEN w.iid
+             END) AS large_wl_strikes
+FROM `wildlife.strikes` AS w
+INNER JOIN wlsizes AS s
+ON (w.wlsize = s.wid)
+INNER JOIN flights AS f
+ON (w.fid = f.fid)
+GROUP BY f.year
+ORDER BY f.year;
+"
+
+# Execute the query to get the result and put it into tabular form using kable() function
+wlsize_per_year = dbGetQuery(conn, find_wlsize_strikes)
+kable(wlsize_per_year)
+```
+## Question 11. Trend by Year
+```{r plot_year_trend, echo=T, warning=F}
+# Write a for loop to get a list of years and list of total strikes from all sizes of wildlife for each year
+all_total_strikes = c()
+all_years = c()
+for (row_idx in (1:nrow(wlsize_per_year))){
+  year = wlsize_per_year[row_idx, 1]
+  all_years = append(all_years, year)
+  total_strikes = sum(wlsize_per_year[row_idx, ][2:4])
+  all_total_strikes = append(all_total_strikes, total_strikes)
+}
+
+# Use the plot() function to create a scatter plot between years from 2000 to 2011 and number of wildlife strike incidents
+plot(all_years, all_total_strikes, main="Total Wildlife Strikes per Year", xlab="Year", ylab="Wildlife Strikes", pch=19)
+```
+## Question 12. Create Stored Procedure
+```{r create_stored_procedure, echo=T, warning=F}
+# Create the table to log updates to strikes data
+create_log_table = "
+CREATE TABLE IF NOT EXISTS update_log(
+  mod_id INTEGER AUTO_INCREMENT,
+  modification TEXT,
+  table_updated TEXT,
+  update_time TIMESTAMP,
+  original_value TEXT,
+  PRIMARY KEY(mod_id)
+);
+"
+dbExecute(conn, create_log_table)
+
+# Create the stored procedure to update strikes data
+create_procedure = "
+CREATE PROCEDURE update_airport_code()
+BEGIN
+     UPDATE airports
+     SET airportCode = 'LGA'
+     WHERE airportName = 'LAGUARDIA NY';
+END
+"
+dbExecute(conn, create_procedure)
+
+# Create a trigger that updates the update_log table when the modification inside the stored procedure is executed
+create_trigger = "
+CREATE TRIGGER check_airportcode_update
+AFTER UPDATE ON airports
+FOR EACH ROW
+BEGIN
+     IF NEW.airportCode != OLD.airportCode THEN
+      INSERT INTO update_log (modification, table_updated,                                        update_time, original_value)
+      VALUES ('Update', 'airports', CURRENT_TIMESTAMP,                            OLD.airportCode);
+     END IF;
+END
+"
+dbExecute(conn, create_trigger)
+```
+## Question 12. Test the stored procedure
+```{r test_procedure, echo=T, warning=F}
+# Execute the stored procedure to update strikes data
+dbExecute(conn, "CALL update_airport_code()")
+
+# Print out update_log table to make sure the modification on the strike event is being logged
+dbGetQuery(conn, "SELECT * FROM update_log LIMIT 10;")
+
+# Print the rows from flights table to make sure the airport codes are changed to 'LGA' if the airport name is ' LAGUARDIA NY'
+select_airports = "
+SELECT aid, airportName, airportCode
+FROM airports
+WHERE airportName = 'LAGUARDIA NY'
+LIMIT 10;
+"
+dbGetQuery(conn, select_airports)
+```
+### Disconnect from the database
+```{r, disconnect_from_df, echo=T, warning=F}
+# Disconnect from the MySQL databse server
+dbDisconnect(conn)
+```
